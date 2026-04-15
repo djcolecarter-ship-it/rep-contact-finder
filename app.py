@@ -20,55 +20,87 @@ HEADERS = {
 }
 
 def get_raw(crd):
-    urls = [
-        f"https://api.adviserinfo.sec.gov/api/individual/individual?crd={crd}",
-        f"https://api.adviserinfo.sec.gov/api/individual/search?query={crd}&hl=true",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
-            if r.status_code == 200:
-                hits = r.json().get("hits", {}).get("hits", [])
-                if hits:
-                    return hits[0].get("_source", {})
-        except Exception:
-            continue
+    """
+    Correct working endpoint confirmed via SEC IAPD / Stack Overflow.
+    Searches by CRD number using ind_source_id match.
+    """
+    params = {
+        "query": crd,
+        "includePrevious": "true",
+        "hl": "true",
+        "nrows": "12",
+        "start": "0",
+        "r": "25",
+        "sort": "score+desc",
+        "wt": "json",
+    }
+    try:
+        r = requests.get(
+            "https://api.adviserinfo.sec.gov/search/individual",
+            params=params,
+            headers=HEADERS,
+            timeout=12
+        )
+        if r.status_code == 200:
+            hits = r.json().get("hits", {}).get("hits", [])
+            # Match exactly by CRD (ind_source_id)
+            for hit in hits:
+                src = hit.get("_source", {})
+                if str(src.get("ind_source_id", "")) == str(crd):
+                    return src
+            # If no exact match, return first result
+            if hits:
+                return hits[0].get("_source", {})
+    except Exception as e:
+        st.error(f"Request error: {e}")
     return None
 
 def safe_list(val):
-    if isinstance(val, list):
-        return val
-    return []
+    return val if isinstance(val, list) else []
 
 def build_card(src, crd):
-    first  = src.get("ind_firstname",  src.get("firstName",  ""))
-    middle = src.get("ind_middlename", src.get("middleName", "")).strip()
-    last   = src.get("ind_lastname",   src.get("lastName",   ""))
+    # Name
+    first  = src.get("ind_firstname", "")
+    middle = src.get("ind_middlename", "").strip()
+    last   = src.get("ind_lastname", "")
     name   = " ".join(x for x in [first, middle, last] if x) or "Not found"
 
-    firms = safe_list(src.get("ind_bc_scope")) or safe_list(src.get("ind_ia_scope")) or safe_list(src.get("currentEmployments"))
+    # Firm — try broker-dealer scope first, then IA scope
+    firms = safe_list(src.get("ind_bc_current_employments"))
+    if not firms:
+        firms = safe_list(src.get("ind_ia_current_employments"))
+    if not firms:
+        firms = safe_list(src.get("ind_bc_scope"))
+
     current_firm = "N/A"
     firm_crd     = "N/A"
     city         = ""
     state_loc    = ""
-    if firms:
-        f            = firms[0]
-        current_firm = f.get("firm_name", f.get("firmName", "N/A"))
-        firm_crd     = str(f.get("firm_id", f.get("firmCrdNumber", "N/A")))
-        city         = f.get("firm_bc_city", f.get("firm_ia_city", f.get("city", "")))
-        state_loc    = f.get("firm_bc_state", f.get("firm_ia_state", f.get("state", "")))
+
+    if firms and isinstance(firms[0], dict):
+        f = firms[0]
+        current_firm = f.get("firm_name", "N/A")
+        firm_crd     = str(f.get("firm_id", "N/A"))
+        city         = f.get("branch_city", f.get("firm_bc_city", f.get("firm_ia_city", "")))
+        state_loc    = f.get("branch_state", f.get("firm_bc_state", f.get("firm_ia_state", "")))
+    elif firms and isinstance(firms[0], str):
+        current_firm = firms[0]
 
     location = ", ".join(x for x in [city, state_loc] if x) or "N/A"
 
-    exams = safe_list(src.get("ind_approved_finra_registration_list")) or safe_list(src.get("currentIaRegistrations"))
+    # Licenses
+    exams = safe_list(src.get("ind_approved_finra_registration_list"))
     lic_names = []
     for e in exams:
         n = e.get("examName", e.get("regDesc", ""))
         if n and n not in lic_names:
             lic_names.append(n)
-    licenses_str = ", ".join(lic_names[:6]) if lic_names else "See BrokerCheck"
+    # Also check registration count as fallback info
+    reg_count = src.get("ind_approved_finra_registration_count", 0)
+    licenses_str = ", ".join(lic_names[:6]) if lic_names else (f"{reg_count} active registration(s) — see BrokerCheck" if reg_count else "See BrokerCheck")
 
-    regs = safe_list(src.get("ind_state_registration_list")) or safe_list(src.get("stateRegistrations"))
+    # Registered States
+    regs = safe_list(src.get("ind_state_registration_list"))
     state_names = []
     for r in regs:
         s = r.get("state", r.get("stateCode", ""))
@@ -76,11 +108,28 @@ def build_card(src, crd):
             state_names.append(s)
     states_str = ", ".join(sorted(state_names)[:8]) if state_names else "N/A"
 
-    disc = src.get("ind_bc_disclosure_fl", src.get("hasDisclosures", "N"))
-    disclosures = "⚠️ YES — review on BrokerCheck" if disc in ["Y", True] else "✅ None reported"
+    # Disclosures
+    disc_bc = src.get("ind_bc_disclosure_fl", "N")
+    disc_ia = src.get("ind_ia_disclosure_fl", "N")
+    disc    = "Y" if "Y" in [disc_bc, disc_ia] else "N"
+    disclosures = "⚠️ YES — review on BrokerCheck" if disc == "Y" else "✅ None reported"
 
-    years = str(src.get("ind_years_in_industry", src.get("yearsInIndustry", "N/A")))
+    # Years / Start date
+    start_date = src.get("ind_industry_cal_date_iapd", src.get("ind_industry_cal_date", ""))
+    years_str  = f"Since {start_date[:4]}" if start_date else "N/A"
 
+    # Employment count
+    emp_count = src.get("ind_employments_count", "N/A")
+
+    # Status
+    bc_scope = src.get("ind_bc_scope", "")
+    ia_scope = src.get("ind_ia_scope", "")
+    if bc_scope == "Active" or ia_scope == "Active":
+        status = "✅ Active"
+    else:
+        status = "⚠️ Not Active / Check BrokerCheck"
+
+    # Links
     bc_link       = f"https://brokercheck.finra.org/individual/summary/{crd}"
     iapd_link     = f"https://adviserinfo.sec.gov/individual/{crd}"
     li_query      = requests.utils.quote(name + " " + current_firm)
@@ -89,9 +138,12 @@ def build_card(src, crd):
     return {
         "name": name, "crd": crd, "firm": current_firm, "firm_crd": firm_crd,
         "location": location, "licenses": licenses_str, "states": states_str,
-        "disclosures": disclosures, "years": years,
+        "disclosures": disclosures, "years": years_str, "emp_count": str(emp_count),
+        "status": status,
         "bc_link": bc_link, "iapd_link": iapd_link, "linkedin_link": linkedin_link,
     }
+
+# ── UI ──────────────────────────────────────────────────────────────────────
 
 with st.form("crd_form"):
     crd_input = st.text_input("CRD Number", placeholder="e.g. 2697880")
@@ -106,7 +158,7 @@ if submitted:
             src = get_raw(crd_clean)
 
         if not src:
-            st.warning("⚠️ No data found for this CRD. Try the links below:")
+            st.warning("⚠️ No data found. Try manually:")
             col1, col2 = st.columns(2)
             with col1:
                 st.link_button("📋 BrokerCheck", f"https://brokercheck.finra.org/individual/summary/{crd_clean}", use_container_width=True)
@@ -115,12 +167,15 @@ if submitted:
         else:
             result = build_card(src, crd_clean)
             st.success(f"✅ Found: **{result['name']}**")
+
             st.markdown(f"""
             <div class='card'>
                 <div class='field-label'>Full Name</div>
                 <div class='field-value'>👤 {result['name']}</div>
                 <div class='field-label'>CRD Number</div>
                 <div class='field-value'>🔢 {result['crd']}</div>
+                <div class='field-label'>Status</div>
+                <div class='field-value'>{result['status']}</div>
                 <div class='field-label'>Current Firm</div>
                 <div class='field-value'>🏢 {result['firm']} <span style='color:#aaa;font-size:13px'>(Firm CRD: {result['firm_crd']})</span></div>
                 <div class='field-label'>Office Location</div>
@@ -129,8 +184,10 @@ if submitted:
                 <div class='field-value'>📜 {result['licenses']}</div>
                 <div class='field-label'>Registered States</div>
                 <div class='field-value'>🗺️ {result['states']}</div>
-                <div class='field-label'>Years in Industry</div>
-                <div class='field-value'>📅 {result['years']} years</div>
+                <div class='field-label'>Industry Start Year</div>
+                <div class='field-value'>📅 {result['years']}</div>
+                <div class='field-label'>Total Firms (Career)</div>
+                <div class='field-value'>🏦 {result['emp_count']}</div>
                 <div class='field-label'>Disclosures</div>
                 <div class='field-value'>{result['disclosures']}</div>
             </div>
@@ -145,4 +202,4 @@ if submitted:
                 st.link_button("🔗 LinkedIn", result["linkedin_link"], use_container_width=True)
 
 st.divider()
-st.caption("Data sourced from SEC IAPD + FINRA BrokerCheck · Built for Thrivent wholesalers")
+st.caption("Data sourced from SEC IAPD · Built for Thrivent wholesalers")
