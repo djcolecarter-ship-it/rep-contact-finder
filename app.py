@@ -8,8 +8,6 @@ st.markdown("""
     .card { background: #1e2a3a; border-radius: 12px; padding: 24px; margin-top: 16px; }
     .field-label { color: #7eb3d8; font-size: 13px; font-weight: 600; text-transform: uppercase; margin-bottom: 2px; }
     .field-value { color: #ffffff; font-size: 16px; margin-bottom: 14px; }
-    .badge-green { background: #1a7a4a; color: white; padding: 2px 10px; border-radius: 20px; font-size: 12px; }
-    .badge-red   { background: #8b1a1a; color: white; padding: 2px 10px; border-radius: 20px; font-size: 12px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -18,132 +16,164 @@ st.caption("Type a CRD → get the full contact card instantly. No copy-paste. N
 
 crd = st.text_input("CRD Number", placeholder="e.g. 2697880", max_chars=8)
 
-def lookup_brokercheck(crd):
-    """Hit the BrokerCheck public endpoint directly."""
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "Referer": "https://brokercheck.finra.org/"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://brokercheck.finra.org",
+    "Referer": "https://brokercheck.finra.org/",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+}
+
+def lookup_by_crd(crd):
+    """Direct CRD lookup using the correct BrokerCheck endpoint."""
+    
+    # Use a session to maintain cookies like a real browser
+    session = requests.Session()
+    
+    # First, hit the main page to get cookies
+    session.get("https://brokercheck.finra.org/", headers=HEADERS, timeout=10)
+    
+    # Now hit the correct individual detail endpoint directly by CRD
+    url = f"https://api.brokercheck.finra.org/individual/{crd}"
+    params = {
+        "hl": "true",
+        "includePrevious": "true",
+        "nrows": "12",
+        "start": "0",
+        "r": "25",
+        "warnBcOnly": "false"
     }
-    # Step 1: Get individual summary
-    summary_url = f"https://api.brokercheck.finra.org/search/individual?query={crd}&hl=true&includePrevious=true&warnBcOnly=false&county=false&firm=false&co=false&nr=false&bd=false&ia=false&iap=false&iard=false&ria=false&riap=false&riard=false&sa=false&ft=false"
-    r = requests.get(summary_url, headers=headers, timeout=10)
-    r.raise_for_status()
-    hits = r.json().get("hits", {}).get("hits", [])
+    
+    r = session.get(url, headers=HEADERS, params=params, timeout=15)
+    
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code} from BrokerCheck API"
+    
+    data = r.json()
+    hits = data.get("hits", {}).get("hits", [])
     
     if not hits:
-        return None
-
+        return None, "No record found for this CRD"
+    
     src = hits[0].get("_source", {})
+    
+    # --- Parse Name ---
+    first = src.get("ind_firstname", "")
+    middle = src.get("ind_middlename", "").strip()
+    last = src.get("ind_lastname", "")
+    name = " ".join(filter(None, [first, middle, last]))
 
-    # Step 2: Get detailed individual report
-    ind_crd = src.get("ind_source_id", crd)
-    detail_url = f"https://api.brokercheck.finra.org/individual/{ind_crd}?hl=true"
-    r2 = requests.get(detail_url, headers=headers, timeout=10)
-    detail = {}
-    if r2.status_code == 200:
-        detail = r2.json().get("hits", {}).get("hits", [{}])[0].get("_source", {})
+    # --- Current Firm ---
+    bc_scope = src.get("ind_bc_scope", [])
+    ia_scope = src.get("ind_ia_scope", [])
+    all_firms = bc_scope + ia_scope
+    current_firm = all_firms[0].get("firm_name", "N/A") if all_firms else "N/A"
+    firm_crd = all_firms[0].get("firm_id", "N/A") if all_firms else "N/A"
 
-    # Parse the data
-    name = src.get("ind_firstname", "") + " " + src.get("ind_middlename", "").strip() + " " + src.get("ind_lastname", "")
-    name = " ".join(name.split())
+    # --- Location ---
+    city = all_firms[0].get("firm_bc_city", all_firms[0].get("firm_ia_city", "")) if all_firms else ""
+    state_loc = all_firms[0].get("firm_bc_state", all_firms[0].get("firm_ia_state", "")) if all_firms else ""
+    location = ", ".join(filter(None, [city, state_loc])) or "N/A"
 
-    firm = src.get("ind_bc_scope", [{}])
-    current_firm = firm[0].get("firm_name", "N/A") if firm else "N/A"
-    firm_crd = firm[0].get("firm_id", "N/A") if firm else "N/A"
+    # --- Licenses ---
+    exams = src.get("ind_approved_finra_registration_list", [])
+    licenses = list(set([e.get("examName", "") for e in exams if e.get("examName")])) if exams else []
+    
+    # Also check examsInfo
+    exams2 = src.get("examsInfo", {}).get("examsList", []) if isinstance(src.get("examsInfo"), dict) else []
+    licenses += [e.get("examName", "") for e in exams2 if e.get("examName")]
+    licenses = list(set(filter(None, licenses)))[:6]
+    licenses_str = ", ".join(licenses) if licenses else "Not found in summary"
 
-    # Licenses
-    exams = detail.get("examsInfo", {}).get("examsList", [])
-    licenses = [e.get("examName", "") for e in exams if e.get("examCategory") in ["S", "PE"]]
-    licenses_str = ", ".join(licenses[:5]) if licenses else "Not found"
+    # --- Registered States ---
+    regs = src.get("ind_state_registration_list", [])
+    states = list(set([r.get("state", "") for r in regs if r.get("state")]))
+    states_str = ", ".join(sorted(states)[:8]) if states else "N/A"
 
-    # Registrations / States
-    regs = detail.get("registrationInfo", {}).get("stateRegistrations", [])
-    states = list(set([r.get("state", "") for r in regs]))[:6]
-    states_str = ", ".join(sorted(states)) if states else "N/A"
+    # --- Disclosures ---
+    disc_flag = src.get("ind_bc_disclosure_fl", "N")
+    disclosures = "⚠️ YES — review on BrokerCheck" if disc_flag == "Y" else "✅ None reported"
 
-    # Disclosures
-    disc_count = src.get("ind_bc_disclosure_fl", "N")
-    disclosures = "⚠️ YES — check BrokerCheck" if disc_count == "Y" else "✅ None"
-
-    # Years in industry
+    # --- Years ---
     years = src.get("ind_years_in_industry", "N/A")
 
-    # Office address
-    office_info = firm[0] if firm else {}
-    city = office_info.get("firm_ia_city", office_info.get("firm_bc_city", ""))
-    state_loc = office_info.get("firm_ia_state", office_info.get("firm_bc_state", ""))
-    location = f"{city}, {state_loc}".strip(", ") or "N/A"
-
-    # BrokerCheck link
-    bc_link = f"https://brokercheck.finra.org/individual/summary/{ind_crd}"
-
-    # LinkedIn search link
-    linkedin_link = f"https://www.linkedin.com/search/results/people/?keywords={requests.utils.quote(name + ' ' + current_firm)}"
+    # --- Links ---
+    bc_link = f"https://brokercheck.finra.org/individual/summary/{crd}"
+    linkedin_search = f"https://www.linkedin.com/search/results/people/?keywords={requests.utils.quote(name + ' ' + current_firm)}"
 
     return {
-        "name": name,
-        "crd": ind_crd,
+        "name": name or "Not found",
+        "crd": crd,
         "firm": current_firm,
         "firm_crd": firm_crd,
         "location": location,
         "licenses": licenses_str,
         "states": states_str,
         "disclosures": disclosures,
-        "years": years,
+        "years": str(years),
         "bc_link": bc_link,
-        "linkedin_link": linkedin_link,
-    }
+        "linkedin_link": linkedin_search,
+    }, None
+
 
 if st.button("🔍 Look Up Contact", type="primary", use_container_width=True):
-    if not crd or not crd.isdigit():
+    if not crd or not crd.strip().isdigit():
         st.error("Please enter a valid numeric CRD number.")
     else:
-        with st.spinner("Pulling data from BrokerCheck..."):
+        with st.spinner("🔄 Pulling live data from FINRA BrokerCheck..."):
             try:
-                data = lookup_brokercheck(crd)
-                if not data:
-                    st.warning("No results found for that CRD. Double-check the number.")
-                else:
-                    st.success(f"✅ Found: {data['name']}")
+                result, error = lookup_by_crd(crd.strip())
+                
+                if error:
+                    st.warning(f"⚠️ {error}")
+                    st.info(f"👉 [Open BrokerCheck manually](https://brokercheck.finra.org/individual/summary/{crd})")
+                elif result:
+                    st.success(f"✅ Found: **{result['name']}**")
+                    
                     st.markdown(f"""
                     <div class='card'>
                         <div class='field-label'>Full Name</div>
-                        <div class='field-value'>👤 {data['name']}</div>
+                        <div class='field-value'>👤 {result['name']}</div>
 
                         <div class='field-label'>CRD Number</div>
-                        <div class='field-value'>🔢 {data['crd']}</div>
+                        <div class='field-value'>🔢 {result['crd']}</div>
 
                         <div class='field-label'>Current Firm</div>
-                        <div class='field-value'>🏢 {data['firm']} &nbsp;<span style='color:#888; font-size:13px'>(Firm CRD: {data['firm_crd']})</span></div>
+                        <div class='field-value'>🏢 {result['firm']} &nbsp;<span style='color:#aaa; font-size:13px'>(Firm CRD: {result['firm_crd']})</span></div>
 
                         <div class='field-label'>Office Location</div>
-                        <div class='field-value'>📍 {data['location']}</div>
+                        <div class='field-value'>📍 {result['location']}</div>
 
                         <div class='field-label'>Licenses</div>
-                        <div class='field-value'>📜 {data['licenses']}</div>
+                        <div class='field-value'>📜 {result['licenses']}</div>
 
                         <div class='field-label'>Registered States</div>
-                        <div class='field-value'>🗺️ {data['states']}</div>
+                        <div class='field-value'>🗺️ {result['states']}</div>
 
                         <div class='field-label'>Years in Industry</div>
-                        <div class='field-value'>📅 {data['years']} years</div>
+                        <div class='field-value'>📅 {result['years']} years</div>
 
                         <div class='field-label'>Disclosures</div>
-                        <div class='field-value'>{data['disclosures']}</div>
+                        <div class='field-value'>{result['disclosures']}</div>
                     </div>
                     """, unsafe_allow_html=True)
 
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.link_button("📋 Full BrokerCheck Report", data['bc_link'], use_container_width=True)
+                        st.link_button("📋 Full BrokerCheck Report", result['bc_link'], use_container_width=True)
                     with col2:
-                        st.link_button("🔗 Search on LinkedIn", data['linkedin_link'], use_container_width=True)
+                        st.link_button("🔗 Search LinkedIn", result['linkedin_link'], use_container_width=True)
 
+            except requests.exceptions.Timeout:
+                st.error("⏱️ Request timed out. BrokerCheck may be slow — try again.")
             except requests.exceptions.RequestException as e:
-                st.error(f"Network error: {e}")
+                st.error(f"🌐 Network error: {e}")
             except Exception as e:
-                st.error(f"Something went wrong: {e}")
+                st.error(f"❌ Unexpected error: {e}")
+                st.code(str(e))
 
 st.divider()
-st.caption("Data pulled live from FINRA BrokerCheck public API · Built for Thrivent wholesalers")
+st.caption("Data pulled live from FINRA BrokerCheck · Built for Thrivent wholesalers")
