@@ -1,86 +1,149 @@
 import streamlit as st
 import requests
-from bs4 import BeautifulSoup
-import re
 
-st.set_page_config(page_title="CRD Contact Finder", page_icon="🎯", layout="centered")
+st.set_page_config(page_title="Rep Contact Finder", page_icon="🎯", layout="centered")
 
-st.title("🎯 CRD Contact Finder")
-st.caption("Backend research — no more copy/paste")
+st.markdown("""
+    <style>
+    .card { background: #1e2a3a; border-radius: 12px; padding: 24px; margin-top: 16px; }
+    .field-label { color: #7eb3d8; font-size: 13px; font-weight: 600; text-transform: uppercase; margin-bottom: 2px; }
+    .field-value { color: #ffffff; font-size: 16px; margin-bottom: 14px; }
+    .badge-green { background: #1a7a4a; color: white; padding: 2px 10px; border-radius: 20px; font-size: 12px; }
+    .badge-red   { background: #8b1a1a; color: white; padding: 2px 10px; border-radius: 20px; font-size: 12px; }
+    </style>
+""", unsafe_allow_html=True)
 
-crd = st.text_input("Enter CRD Number", placeholder="2697880", max_chars=8)
+st.title("🎯 Rep Contact Finder")
+st.caption("Type a CRD → get the full contact card instantly. No copy-paste. No Copilot needed.")
 
-if st.button("🚀 Run Full Research", type="primary", use_container_width=True):
-    if not crd.isdigit() or not (4 <= len(crd) <= 8):
-        st.error("Please enter a valid CRD (4–8 digits)")
-        st.stop()
+crd = st.text_input("CRD Number", placeholder="e.g. 2697880", max_chars=8)
 
-    with st.spinner("Researching BrokerCheck + IAPD + web..."):
-        result = {
-            "name": "Not found",
-            "firm": "Not found",
-            "title": "Not found",
-            "location": "Not found",
-            "email": "Not found (public sources limited)",
-            "phone": "Not found (public sources limited)",
-            "linkedin": "Not found",
-            "licenses": "Not found",
-            "disclosures": "None found"
-        }
+def lookup_brokercheck(crd):
+    """Hit the BrokerCheck public endpoint directly."""
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Referer": "https://brokercheck.finra.org/"
+    }
+    # Step 1: Get individual summary
+    summary_url = f"https://api.brokercheck.finra.org/search/individual?query={crd}&hl=true&includePrevious=true&warnBcOnly=false&county=false&firm=false&co=false&nr=false&bd=false&ia=false&iap=false&iard=false&ria=false&riap=false&riard=false&sa=false&ft=false"
+    r = requests.get(summary_url, headers=headers, timeout=10)
+    r.raise_for_status()
+    hits = r.json().get("hits", {}).get("hits", [])
+    
+    if not hits:
+        return None
 
-        # BrokerCheck scrape
-        try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            r = requests.get(f"https://brokercheck.finra.org/individual/summary/{crd}", headers=headers, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-            
-            # Try to extract name and firm (BrokerCheck puts data in script tags or title)
-            title = soup.find("title")
-            if title:
-                title_text = title.get_text()
-                if " - " in title_text:
-                    result["name"] = title_text.split(" - ")[0].strip()
-                    result["firm"] = title_text.split(" - ")[-1].strip()
-        except:
-            pass
+    src = hits[0].get("_source", {})
 
-        # IAPD scrape (basic)
-        try:
-            r2 = requests.get(f"https://adviserinfo.sec.gov/search/individual?query={crd}", headers=headers, timeout=10)
-            if "No results" not in r2.text:
-                result["firm"] = "Found in IAPD (see details below)"
-        except:
-            pass
+    # Step 2: Get detailed individual report
+    ind_crd = src.get("ind_source_id", crd)
+    detail_url = f"https://api.brokercheck.finra.org/individual/{ind_crd}?hl=true"
+    r2 = requests.get(detail_url, headers=headers, timeout=10)
+    detail = {}
+    if r2.status_code == 200:
+        detail = r2.json().get("hits", {}).get("hits", [{}])[0].get("_source", {})
 
-        # Display clean card
-        st.success(f"✅ Research complete for CRD {crd}")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Full Name**")
-            st.write(result["name"])
-            st.markdown("**Current Firm**")
-            st.write(result["firm"])
-            st.markdown("**Title / Role**")
-            st.write(result["title"])
-        with col2:
-            st.markdown("**Branch / Location**")
-            st.write(result["location"])
-            st.markdown("**Best Email**")
-            st.write(result["email"])
-            st.markdown("**Best Phone**")
-            st.write(result["phone"])
+    # Parse the data
+    name = src.get("ind_firstname", "") + " " + src.get("ind_middlename", "").strip() + " " + src.get("ind_lastname", "")
+    name = " ".join(name.split())
 
-        st.markdown("**Licenses**")
-        st.write(result["licenses"])
-        st.markdown("**Disclosures**")
-        st.write(result["disclosures"])
+    firm = src.get("ind_bc_scope", [{}])
+    current_firm = firm[0].get("firm_name", "N/A") if firm else "N/A"
+    firm_crd = firm[0].get("firm_id", "N/A") if firm else "N/A"
 
-        st.info("Email & phone are hard to scrape automatically on free tier. If nothing shows, try the prompt below or use Copilot manually.")
+    # Licenses
+    exams = detail.get("examsInfo", {}).get("examsList", [])
+    licenses = [e.get("examName", "") for e in exams if e.get("examCategory") in ["S", "PE"]]
+    licenses_str = ", ".join(licenses[:5]) if licenses else "Not found"
 
-        # Fallback prompt (if you still want it)
-        if st.button("Show Copilot Prompt as Backup"):
-            prompt = f"You are an expert financial wholesaler contact researcher.\n\nCRD: **{crd}**\n\nFull research on BrokerCheck, IAPD, Google, LinkedIn for latest email and phone."
-            st.text_area("Copy this if needed:", prompt, height=200)
+    # Registrations / States
+    regs = detail.get("registrationInfo", {}).get("stateRegistrations", [])
+    states = list(set([r.get("state", "") for r in regs]))[:6]
+    states_str = ", ".join(sorted(states)) if states else "N/A"
 
-st.caption("Live at https://rep-contact-finder.streamlit.app — built for you")
+    # Disclosures
+    disc_count = src.get("ind_bc_disclosure_fl", "N")
+    disclosures = "⚠️ YES — check BrokerCheck" if disc_count == "Y" else "✅ None"
+
+    # Years in industry
+    years = src.get("ind_years_in_industry", "N/A")
+
+    # Office address
+    office_info = firm[0] if firm else {}
+    city = office_info.get("firm_ia_city", office_info.get("firm_bc_city", ""))
+    state_loc = office_info.get("firm_ia_state", office_info.get("firm_bc_state", ""))
+    location = f"{city}, {state_loc}".strip(", ") or "N/A"
+
+    # BrokerCheck link
+    bc_link = f"https://brokercheck.finra.org/individual/summary/{ind_crd}"
+
+    # LinkedIn search link
+    linkedin_link = f"https://www.linkedin.com/search/results/people/?keywords={requests.utils.quote(name + ' ' + current_firm)}"
+
+    return {
+        "name": name,
+        "crd": ind_crd,
+        "firm": current_firm,
+        "firm_crd": firm_crd,
+        "location": location,
+        "licenses": licenses_str,
+        "states": states_str,
+        "disclosures": disclosures,
+        "years": years,
+        "bc_link": bc_link,
+        "linkedin_link": linkedin_link,
+    }
+
+if st.button("🔍 Look Up Contact", type="primary", use_container_width=True):
+    if not crd or not crd.isdigit():
+        st.error("Please enter a valid numeric CRD number.")
+    else:
+        with st.spinner("Pulling data from BrokerCheck..."):
+            try:
+                data = lookup_brokercheck(crd)
+                if not data:
+                    st.warning("No results found for that CRD. Double-check the number.")
+                else:
+                    st.success(f"✅ Found: {data['name']}")
+                    st.markdown(f"""
+                    <div class='card'>
+                        <div class='field-label'>Full Name</div>
+                        <div class='field-value'>👤 {data['name']}</div>
+
+                        <div class='field-label'>CRD Number</div>
+                        <div class='field-value'>🔢 {data['crd']}</div>
+
+                        <div class='field-label'>Current Firm</div>
+                        <div class='field-value'>🏢 {data['firm']} &nbsp;<span style='color:#888; font-size:13px'>(Firm CRD: {data['firm_crd']})</span></div>
+
+                        <div class='field-label'>Office Location</div>
+                        <div class='field-value'>📍 {data['location']}</div>
+
+                        <div class='field-label'>Licenses</div>
+                        <div class='field-value'>📜 {data['licenses']}</div>
+
+                        <div class='field-label'>Registered States</div>
+                        <div class='field-value'>🗺️ {data['states']}</div>
+
+                        <div class='field-label'>Years in Industry</div>
+                        <div class='field-value'>📅 {data['years']} years</div>
+
+                        <div class='field-label'>Disclosures</div>
+                        <div class='field-value'>{data['disclosures']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.link_button("📋 Full BrokerCheck Report", data['bc_link'], use_container_width=True)
+                    with col2:
+                        st.link_button("🔗 Search on LinkedIn", data['linkedin_link'], use_container_width=True)
+
+            except requests.exceptions.RequestException as e:
+                st.error(f"Network error: {e}")
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+
+st.divider()
+st.caption("Data pulled live from FINRA BrokerCheck public API · Built for Thrivent wholesalers")
