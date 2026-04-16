@@ -164,7 +164,7 @@ def clean_phone(phone):
 @st.cache_data(ttl=86400)
 def enrich_with_claude(name, crd, firm, loc, api_key):
     """
-    Calls claude-sonnet-4-20250514 with web_search tool enabled.
+    Calls claude-sonnet-4-6 with web_search tool enabled.
     Searches live web for phone, email, title, bio notes, LinkedIn.
     Results cached 24hrs per CRD to save API cost.
     """
@@ -214,7 +214,7 @@ Rules:
     }
 
     body = {
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-sonnet-4-6",
         "max_tokens": 1024,
         "tools": [{"type": "web_search_20250305", "name": "web_search"}],
         "messages": [{"role": "user", "content": prompt}],
