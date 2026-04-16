@@ -105,7 +105,7 @@ Return ONLY valid JSON (no markdown, no extra text):
 }}"""
 
     headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": "claude-3-5-sonnet-20241022", "max_tokens": 1024, "tools": [{"type": "web_search_20250305", "name": "web_search"}], "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "claude-sonnet-4-6", "max_tokens": 1024, "tools": [{"type": "web_search_20250305", "name": "web_search"}], "messages": [{"role": "user", "content": prompt}]}
 
     try:
         r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=60)
