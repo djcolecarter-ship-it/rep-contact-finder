@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import json
+import re
 
 st.set_page_config(page_title="Rep Contact Finder", page_icon="🎯", layout="centered")
 
@@ -26,7 +27,7 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# ── SEC IAPD FUNCTIONS (unchanged from your original) ───────────────────────
+# ── SEC IAPD ─────────────────────────────────────────────────────────────────
 
 def get_raw(crd):
     params = {
@@ -133,86 +134,78 @@ def build_card(src, crd):
         "bc_link": bc_link, "iapd_link": iapd_link, "linkedin_link": linkedin_link,
     }
 
-# ── CLAUDE ENRICHMENT ────────────────────────────────────────────────────────
-
-import re
-import json
-import requests
-import streamlit as st
-
-# ── Helpers ────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def extract_json(text):
-    """Safely extract JSON from Claude response"""
     try:
         return json.loads(text)
     except:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
-            return json.loads(match.group())
-    return {"error": "Failed to parse JSON"}
+            try:
+                return json.loads(match.group())
+            except:
+                pass
+    return {"error": "Failed to parse JSON from Claude response"}
 
 def is_valid_email(email):
     if not email:
         return False
-    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email)
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
 
 def clean_phone(phone):
     if not phone:
         return None
     digits = re.sub(r"\D", "", phone)
-    if len(digits) >= 10:
-        return phone
-    return None
+    return phone if len(digits) >= 10 else None
 
-# ── Enrichment ─────────────────────────────────────────────────────────────
+# ── Claude Enrichment (with live web search) ──────────────────────────────────
 
 @st.cache_data(ttl=86400)
-def enrich_with_claude(result: dict, api_key: str) -> dict:
+def enrich_with_claude(name, crd, firm, loc, api_key):
     """
-    Safer enrichment without web_search.
-    Claude uses general knowledge + inference (lower reliability but stable).
+    Calls claude-sonnet-4-20250514 with web_search tool enabled.
+    Searches live web for phone, email, title, bio notes, LinkedIn.
+    Results cached 24hrs per CRD to save API cost.
     """
 
-    name = result["name"]
-    firm = result["firm"]
-    loc  = result["location"]
-    crd  = result["crd"]
+    prompt = f"""You are a financial industry contact researcher. Search the web to find current contact details for this registered financial advisor.
 
-    prompt = f"""
-You are a financial sales intelligence assistant.
-
-Given:
 Name: {name}
 CRD: {crd}
-Firm: {firm}
+Current Firm: {firm}
 Location: {loc}
 
-Task:
-Provide BEST-EFFORT publicly known professional contact details.
-DO NOT guess or hallucinate.
+Search for:
+1. Their direct business phone number
+2. Their business email address
+3. Their direct LinkedIn profile URL (the actual profile, not a search)
+4. Their title/role at the current firm
+5. Any useful notes from their firm bio page (AUM, specialties, team name, client type)
 
-Return ONLY valid JSON:
+Try these searches:
+- "{name}" "{firm}" contact phone
+- "{name}" "{firm}" email
+- "{name}" financial advisor {loc}
+- "{name}" site:[firm's likely website domain]
+
+Return ONLY a valid JSON object with no extra text or markdown fences:
 
 {{
   "phone": "value or null",
   "email": "value or null",
-  "linkedin_direct": "full URL or null",
+  "linkedin_direct": "full profile URL or null",
   "title": "value or null",
-  "bio_notes": "short summary or null",
+  "bio_notes": "1-2 sentence summary from bio or null",
   "confidence": "High or Medium or Low",
-  "sources_checked": [],
-  "caveats": "explain limitations briefly"
+  "sources_checked": ["list of domains where you found info"],
+  "caveats": "brief note on data quality or null"
 }}
 
 Rules:
-- If unsure → return null
-- Prefer firm-level contact over personal guess
-- Confidence:
-  High = multiple strong signals
-  Medium = partial info
-  Low = mostly unknown
-"""
+- Never invent or guess contact info. Only return what you actually found on the web.
+- confidence = High if phone+email both confirmed, Medium if one found, Low if neither found.
+- If you find conflicting info across sources, use the most recent and note it in caveats."""
 
     headers = {
         "x-api-key": api_key,
@@ -221,12 +214,10 @@ Rules:
     }
 
     body = {
-        "model": "claude-3-haiku-20240307",
-        "max_tokens": 400,
-        "temperature": 0,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "messages": [{"role": "user", "content": prompt}],
     }
 
     try:
@@ -234,36 +225,29 @@ Rules:
             "https://api.anthropic.com/v1/messages",
             headers=headers,
             json=body,
-            timeout=30
+            timeout=60,
         )
 
         if r.status_code != 200:
-            return {"error": f"Claude API error {r.status_code}: {r.text[:200]}"}
+            return {"error": f"Claude API error {r.status_code}: {r.text[:300]}"}
 
         data = r.json()
 
-        text_blocks = [
-            b["text"] for b in data.get("content", [])
-            if b.get("type") == "text"
-        ]
-
+        # Get the last text block (after any tool use rounds)
+        text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
         if not text_blocks:
-            return {"error": "No text returned from Claude"}
+            return {"error": "No text response returned from Claude."}
 
-        raw_text = text_blocks[-1].strip()
-
-        parsed = extract_json(raw_text)
+        parsed = extract_json(text_blocks[-1].strip())
 
         if "error" in parsed:
             return parsed
 
-        # ── Validation Layer ──
+        # Validate fields
         email = parsed.get("email")
         phone = parsed.get("phone")
-
         if email and not is_valid_email(email):
             email = None
-
         phone = clean_phone(phone)
 
         return {
@@ -274,13 +258,13 @@ Rules:
             "bio_notes": parsed.get("bio_notes"),
             "confidence": parsed.get("confidence", "Low"),
             "sources_checked": parsed.get("sources_checked", []),
-            "caveats": parsed.get("caveats", "AI-generated; verify before use")
+            "caveats": parsed.get("caveats", "Verify before use"),
         }
 
     except Exception as e:
         return {"error": f"Enrichment failed: {str(e)}"}
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 
 api_key = st.secrets["ANTHROPIC_API_KEY"]
 
@@ -311,7 +295,6 @@ if submitted or enrich:
             result = build_card(src, crd_clean)
             st.success(f"✅ Found: **{result['name']}**")
 
-            # ── Base card (unchanged layout) ──
             st.markdown(f"""
             <div class='card'>
                 <div class='field-label'>Full Name</div>
@@ -343,55 +326,53 @@ if submitted or enrich:
             with col2:
                 st.link_button("🏛️ SEC IAPD", result["iapd_link"], use_container_width=True)
             with col3:
-                st.link_button("🔗 LinkedIn", result["linkedin_link"], use_container_width=True)
+                st.link_button("🔗 LinkedIn Search", result["linkedin_link"], use_container_width=True)
 
             # ── AI Enrichment ──
             if enrich:
-                api_key = st.secrets["ANTHROPIC_API_KEY"]
-                if not api_key:
-                    st.warning("⚠️ Enter your Anthropic API key in the ⚙️ settings above to use AI enrichment.")
+                with st.spinner("🤖 Claude is searching the web for phone, email, and bio notes... (15–40 sec)"):
+                    enriched = enrich_with_claude(
+                        result["name"], result["crd"],
+                        result["firm"], result["location"],
+                        api_key
+                    )
+
+                if "error" in enriched:
+                    st.error(f"Enrichment error: {enriched['error']}")
                 else:
-                    with st.spinner("🤖 Claude is searching the web for phone, email, and bio notes... (10–30 sec)"):
-                        enriched = enrich_with_claude(result, api_key)
+                    conf = enriched.get("confidence", "Low")
+                    conf_class = {"High": "confidence-high", "Medium": "confidence-medium"}.get(conf, "confidence-low")
 
-                    if "error" in enriched:
-                        st.error(f"Enrichment error: {enriched['error']}")
-                    else:
-                        conf = enriched.get("confidence", "Low")
-                        conf_class = {"High": "confidence-high", "Medium": "confidence-medium"}.get(conf, "confidence-low")
+                    phone      = enriched.get("phone") or "Not found"
+                    email      = enriched.get("email") or "Not found"
+                    title      = enriched.get("title") or "Not found"
+                    bio_notes  = enriched.get("bio_notes") or "None found"
+                    sources    = ", ".join(enriched.get("sources_checked", [])) or "None"
+                    caveats    = enriched.get("caveats") or "None"
 
-                        phone         = enriched.get("phone") or "Not found"
-                        email         = enriched.get("email") or "Not found"
-                        linkedin_d    = enriched.get("linkedin_direct") or result["linkedin_link"]
-                        title         = enriched.get("title") or "Not found"
-                        bio_notes     = enriched.get("bio_notes") or "None found"
-                        sources       = ", ".join(enriched.get("sources_checked", [])) or "None"
-                        caveats       = enriched.get("caveats") or "None"
-
-                        st.markdown(f"""
-                        <div class='enrich-card'>
-                            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;'>
-                                <span style='color:#7ed87e;font-size:15px;font-weight:700;'>🤖 AI Enrichment Results</span>
-                                <span class='{conf_class}'>Confidence: {conf}</span>
-                            </div>
-                            <div class='enrich-label'>Direct Phone</div>
-                            <div class='enrich-value'>📞 {phone}</div>
-                            <div class='enrich-label'>Business Email</div>
-                            <div class='enrich-value'>📧 {email}</div>
-                            <div class='enrich-label'>Title at Current Firm</div>
-                            <div class='enrich-value'>💼 {title}</div>
-                            <div class='enrich-label'>Bio / Notes</div>
-                            <div class='enrich-value'>📝 {bio_notes}</div>
-                            <div class='enrich-label'>Sources Checked</div>
-                            <div class='enrich-value' style='font-size:13px;color:#aaa;'>🔗 {sources}</div>
-                            <div class='enrich-label'>Caveats</div>
-                            <div class='enrich-value' style='font-size:13px;color:#ffcc80;'>⚠️ {caveats}</div>
+                    st.markdown(f"""
+                    <div class='enrich-card'>
+                        <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;'>
+                            <span style='color:#7ed87e;font-size:15px;font-weight:700;'>🤖 AI Enrichment Results</span>
+                            <span class='{conf_class}'>Confidence: {conf}</span>
                         </div>
-                        """, unsafe_allow_html=True)
+                        <div class='enrich-label'>Direct Phone</div>
+                        <div class='enrich-value'>📞 {phone}</div>
+                        <div class='enrich-label'>Business Email</div>
+                        <div class='enrich-value'>📧 {email}</div>
+                        <div class='enrich-label'>Title at Current Firm</div>
+                        <div class='enrich-value'>💼 {title}</div>
+                        <div class='enrich-label'>Bio / Notes</div>
+                        <div class='enrich-value'>📝 {bio_notes}</div>
+                        <div class='enrich-label'>Sources Checked</div>
+                        <div class='enrich-value' style='font-size:13px;color:#aaa;'>🔗 {sources}</div>
+                        <div class='enrich-label'>Caveats</div>
+                        <div class='enrich-value' style='font-size:13px;color:#ffcc80;'>⚠️ {caveats}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                        # Direct LinkedIn button if found
-                        if enriched.get("linkedin_direct"):
-                            st.link_button("🔗 Direct LinkedIn Profile", enriched["linkedin_direct"], use_container_width=True)
+                    if enriched.get("linkedin_direct"):
+                        st.link_button("🔗 Direct LinkedIn Profile", enriched["linkedin_direct"], use_container_width=True)
 
 st.divider()
 st.caption("Data sourced from SEC IAPD · AI enrichment via Anthropic Claude with web search · Built for Thrivent wholesalers · Use contact data in accordance with your firm's policies and FINRA/CAN-SPAM requirements.")
