@@ -29,7 +29,6 @@ if "ANTHROPIC_API_KEY" not in st.secrets:
 else:
     api_key = st.secrets["ANTHROPIC_API_KEY"]
 
-# ── Your original functions (kept exactly as you wrote them) ────────────────
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 def get_raw(crd):
@@ -61,16 +60,22 @@ def build_card(src, crd):
     current_firm = firms[0].get("firm_name", "N/A") if firms and isinstance(firms[0], dict) else "N/A"
     location = f"{firms[0].get('branch_city','')}, {firms[0].get('branch_state','')}" if firms and isinstance(firms[0], dict) else "N/A"
 
+    # ←←← RESTORED REGISTRATION STATUS ←←←
+    bc_scope = src.get("ind_bc_scope", "")
+    ia_scope = src.get("ind_ia_scope", "")
+    status = "✅ Active" if bc_scope == "Active" or ia_scope == "Active" else "⚠️ Not Active / Check BrokerCheck"
+
     bc_link = f"https://brokercheck.finra.org/individual/summary/{crd}"
     iapd_link = f"https://adviserinfo.sec.gov/individual/{crd}"
     linkedin_search = f"https://www.linkedin.com/search/results/people/?keywords={requests.utils.quote(name + ' ' + current_firm)}"
 
     return {
         "name": name, "crd": crd, "firm": current_firm, "location": location,
+        "status": status,
         "bc_link": bc_link, "iapd_link": iapd_link, "linkedin_search": linkedin_search
     }
 
-# ── Claude Enrichment (updated prompt) ───────────────────────────────────────
+# ── Claude Enrichment (unchanged) ───────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def enrich_with_claude(name, crd, firm, loc, api_key):
     if not api_key:
@@ -87,11 +92,11 @@ Find:
 - Direct business phone
 - Business email
 - Direct LinkedIn profile URL
-- Firm website URL (the actual company site, not a search page)
+- Firm website URL
 - Current title/role at the firm
 - Any useful bio notes
 
-Return ONLY valid JSON (no markdown, no extra text):
+Return ONLY valid JSON:
 {{
   "phone": "value or null",
   "email": "value or null",
@@ -143,13 +148,15 @@ if submitted or enrich:
             result = build_card(src, crd_clean)
             st.success(f"✅ Found: **{result['name']}**")
 
-            # Clean main card (no licenses/states)
+            # Clean card with Active status restored
             st.markdown(f"""
             <div class='card'>
                 <div class='field-label'>Full Name</div>
                 <div class='field-value'>👤 {result['name']}</div>
                 <div class='field-label'>CRD Number</div>
                 <div class='field-value'>🔢 {result['crd']}</div>
+                <div class='field-label'>Status</div>
+                <div class='field-value'>{result['status']}</div>
                 <div class='field-label'>Current Firm</div>
                 <div class='field-value'>🏢 {result['firm']}</div>
                 <div class='field-label'>Office Location</div>
@@ -165,7 +172,7 @@ if submitted or enrich:
             with col3:
                 st.link_button("🔗 LinkedIn Search", result["linkedin_search"], use_container_width=True)
 
-            # AI Enrichment
+            # AI Enrichment section (unchanged)
             if enrich:
                 with st.spinner("🤖 Claude is searching the web for email, phone, firm website, and LinkedIn..."):
                     enriched = enrich_with_claude(result["name"], result["crd"], result["firm"], result["location"], api_key)
@@ -197,7 +204,6 @@ if submitted or enrich:
                     </div>
                     """, unsafe_allow_html=True)
 
-                    # Direct links if found
                     if enriched.get("firm_website"):
                         st.link_button("🌐 Visit Firm Website", enriched["firm_website"], use_container_width=True)
                     if enriched.get("linkedin_direct"):
