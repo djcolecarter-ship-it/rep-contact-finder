@@ -132,7 +132,7 @@ with st.form("crd_form"):
     with col_a:
         submitted = st.form_submit_button("🔍 Look Up Contact", use_container_width=True, type="primary")
     with col_b:
-        enrich = st.form_submit_button("🤖 Look Up + AI Enrich (find email/phone/website)", use_container_width=True)
+        enrich = st.form_submit_button("🤖 AI Enrich (find email/phone/website) cost $0.10", use_container_width=True)
 
 if submitted or enrich:
     crd_clean = crd_input.strip()
