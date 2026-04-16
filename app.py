@@ -227,14 +227,7 @@ Rules:
 
 # ── UI ───────────────────────────────────────────────────────────────────────
 
-# API key input — stored in session so user only types it once per session
-with st.expander("⚙️ Claude API Key (required for AI enrichment)", expanded=False):
-    st.markdown("Get a free key at [console.anthropic.com](https://console.anthropic.com). Stored in session only — never saved.")
-    api_key_input = st.text_input("Anthropic API Key", type="password", key="api_key_field",
-                                   placeholder="sk-ant-...")
-    if api_key_input:
-        st.session_state["claude_api_key"] = api_key_input
-        st.success("Key saved for this session.")
+api_key = st.secrets["ANTHROPIC_API_KEY"]
 
 with st.form("crd_form"):
     crd_input = st.text_input("CRD Number", placeholder="e.g. 2697880")
@@ -299,7 +292,7 @@ if submitted or enrich:
 
             # ── AI Enrichment ──
             if enrich:
-                api_key = st.session_state.get("claude_api_key", "")
+                api_key = st.secrets["ANTHROPIC_API_KEY"]
                 if not api_key:
                     st.warning("⚠️ Enter your Anthropic API key in the ⚙️ settings above to use AI enrichment.")
                 else:
